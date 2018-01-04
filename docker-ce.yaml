@@ -1,0 +1,194 @@
+#First we need to make sure we’re running our specified version of docker on clean ubuntu nodes. The following code operates on all of our hosts, those that will be our managers and those that will be our workers.
+---
+
+- hosts: all
+  remote_user: root
+  become: yes
+  become_method: sudo
+  tasks:
+#The following tasks check that no previous installs of docker exist on our nodes.
+  - name: "add docker repository"
+    apt_repository: repo='deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable' state=present
+    when: ansible_distribution == "Ubuntu"
+
+  - name: "ensure old versions of docker are purged 1"
+    apt: name=lxc-docker state=absent purge=yes
+    when: ansible_distribution == "Ubuntu"
+
+  - name: "ensure old versions of docker are purged 2"
+    apt: name=docker state=absent purge=yes
+    when: ansible_distribution == "Ubuntu"
+
+  - name: "ensure old versions of docker are purged 3"
+    apt: name=docker-engine state=absent purge=yes
+    when: ansible_distribution == "Ubuntu"
+
+  - name: "ensure old versions of docker are purged 4"
+    apt: name=docker.io state=absent purge=yes
+    when: ansible_distribution == "Ubuntu"
+#The following tasks check the version of the current kernel and then downloads the appropriate ubuntu 14.04.
+  - name: "get kernel version"
+    shell: uname -r
+    register: kernel
+
+  - name: "install 14.04 pre-req 1"
+    apt:
+        name: linux-image-extra-{{ kernel.stdout }}
+        state: present
+        update_cache: yes
+        install_recommends: yes
+    when: ansible_distribution == "Ubuntu"
+    retries: 3
+    delay: 20
+
+  - name: "install 14.04 pre-req 2"
+    apt: name=linux-image-extra-virtual state=present update_cache=yes install_recommends=yes
+    when: ansible_distribution == "Ubuntu"
+    retries: 3
+    delay: 20
+#The following task installs the docker version specified in extraVars. An example input would be '17.06.2*’.
+  - name: "install docker"
+    apt: name=docker-ce=17.06.2* state=present update_cache=yes install_recommends=yes allow_unauthenticated=yes
+    when: ansible_distribution == "Ubuntu"
+    retries: 3
+    delay: 20
+#These tasks create a docker group, add ubuntu as a user, and restart the service so that we don’t need to use sudo every time we use a docker command
+  - name: "add docker group"
+    group: name=docker state=present
+
+  - name: "add ubuntu to docker group"
+    user: name=ubuntu groups=docker append=yes
+
+  - name: "Restart Docker service"
+    service: name=docker state=started
+
+  - name: "get docker info"
+    shell: docker info
+    register: docker_info
+    changed_when: False
+#The following tasks will be run on the node specified to be the first manager in the hosts file.
+- hosts: docker-manager-first
+  remote_user: root
+  become: yes
+  become_method: sudo
+  tasks:
+#The following tasks initiates a docker swarm and then grabs the swarm master and worker tokens needed to add more hosts to the swarm.
+  - name: "create primary swarm manager"
+    shell: docker swarm init --advertise-addr {{ ansible_eth0['ipv4']['address'] }}
+    when: "docker_info.stdout.find('Swarm: inactive') != -1"
+
+  - name: "get docker swarm manager token"
+    shell: docker swarm join-token -q manager
+    register: manager_token
+
+  - name: "get docker swarm worker token"
+    shell: docker swarm join-token -q worker
+    register: worker_token
+#The following tasks run on all nodes designated as docker managers in the hosts file, adding each to the swarm as managers.
+- hosts: docker-managers
+  remote_user: root
+  become: yes
+  become_method: sudo
+  tasks:
+  - name: "join as a manager"
+    shell: "docker swarm join --token {{ hostvars['manager1']['manager_token']['stdout'] }} {{ hostvars['manager1']['ansible_eth0']['ipv4']['address'] }}:2377"
+    when: docker_info.stdout.find("Swarm{{':'}} inactive") != -1
+    retries: 3
+    delay: 20
+    #The following tasks run on all nodes designated as docker workers in the hosts file, adding each to the swarm as workers.
+
+- hosts: docker-workers
+  remote_user: root
+  become: yes
+  become_method: sudo
+  tasks:
+  - name: "join as a worker"
+    shell: "docker swarm join --token {{ hostvars['manager1']['worker_token']['stdout'] }} {{ hostvars['manager1']['ansible_eth0']['ipv4']['address'] }}:2377"
+    when: "docker_info.stdout.find('Swarm: inactive') != -1"
+    retries: 3
+    delay: 20
+#The following tasks will run on all the manager nodes, designated in the hosts file under docker-api and confirms that the api is running on these nodes and exposed. If it is not, it stops docker, exposes it, and restarts it.
+- hosts: docker-api
+  remote_user: root
+  become: yes
+  become_method: sudo
+  tasks:
+  - name: "Confirm Service Exists"
+    stat: path=/etc/init.d/docker
+    register: service_wrapper
+
+  - name: "Check whether api already exposed"
+    command: "grep 'DOCKER_OPTS=\"-D -H tcp://0.0.0.0:4243 -H unix:///var/run/docker.sock\"' /etc/default/docker"
+    register: check_has_api
+    always_run: True
+    ignore_errors: True
+    changed_when: False
+
+  - name: "Stop Docker"
+    service: name=docker state=stopped
+    when:
+      - service_wrapper.stat.exists
+      - check_has_api.stdout == ""
+    register: service_stopped
+
+  - name: "expose docker api"
+    lineinfile: "dest=/etc/default/docker state=present regexp='#DOCKER_OPTS=' line='DOCKER_OPTS=\"-H tcp://0.0.0.0:4243 -H unix:///var/run/docker.sock\"'"
+    when:
+      - service_stopped
+      - check_has_api.stdout == ""
+
+  - name: "Restart Docker service"
+    service: name=docker state=started
+    when:
+      - service_wrapper.stat.exists
+      - check_has_api.stdout == ""
+
+#The following tasks will run on all the manager nodes, designated in the hosts file under docker-cloud and confirms that there is a daemon file on each. If it is not, it stops docker, creates the daemon file, and restarts docker.
+- hosts: docker-cloud
+  remote_user: root
+  become: yes
+  become_method: sudo
+  tasks:
+  - name: "Confirm Service Exists"
+    stat: path=/etc/init.d/docker
+    register: service_wrapper
+
+  - name: "check for daemon file"
+    stat: path=/etc/docker/daemon.json
+    register: daemon_file
+
+  - name: "Stop Docker"
+    service: name=docker state=stopped
+    when:
+      - service_wrapper.stat.exists
+      - not daemon_file.stat.exists
+    register: service_stopped
+
+  - name: "create daemon file"
+    template: src=templates/daemon.j2 dest=/etc/docker/daemon.json
+    when: not daemon_file.stat.exists
+
+  - name: "Restart Docker service"
+    service: name=docker state=started
+    when:
+      - service_wrapper.stat.exists
+#List the networks on our docker manager, this is the output we will use to determine if any networks need to be created.
+- hosts: docker-manager-first
+  remote_user: root
+  become: yes
+  become_method: sudo
+  tasks:
+  - name: List networks
+    shell: docker network ls
+    register: docker_networks
+#After checking if the default network exists, if it doesn’t (note the when clause below) Ansible will work through our list of networks provided in extraVars and create each one with the specified subnet, gateway, and name. This network allows containers within this service to communicate properly. 
+  - name: Create network when not there
+    shell: docker network create --driver overlay --subnet {{ item.subnet }} --gateway {{ item.gateway }} {{ item.name }}
+    with_items:
+        -  {
+            	name: 'caylent-default',
+            	subnet: '17.0.0.0/16',
+            	gateway: '17.0.0.1'
+            }
+
+    when: docker_networks.stdout.find( item.name ) == -1
